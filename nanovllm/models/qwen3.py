@@ -97,12 +97,12 @@ class Qwen3MLP(nn.Module):
         hidden_act: str,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear( # 将gate_proj和up_proj合并为一个线性层，减少计算开销
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelLinear( # 将down_proj改为行并行线性层，适应前面合并后的输出维度
             intermediate_size,
             hidden_size,
             bias=False,

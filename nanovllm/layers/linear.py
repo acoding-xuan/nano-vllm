@@ -19,7 +19,7 @@ class LinearBase(nn.Module):
         tp_dim: int | None = None,
     ):
         super().__init__()
-        self.tp_dim = tp_dim
+        self.tp_dim = tp_dim # 在第几个维度上进行切分， None表示不切分， 0表示列，1表示行
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
@@ -34,7 +34,7 @@ class LinearBase(nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
+class ReplicatedLinear(LinearBase): # 没用 tp
 
     def __init__(
         self,
@@ -51,7 +51,7 @@ class ReplicatedLinear(LinearBase):
         return F.linear(x, self.weight, self.bias)
 
 
-class ColumnParallelLinear(LinearBase):
+class ColumnParallelLinear(LinearBase): # 列并行线性层
 
     def __init__(
         self,
@@ -84,7 +84,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
+    # loaded_shard_id表示当前加载的权重属于哪个输出分支 是 gate 还是 up_proj    
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int): 
         param_data = param.data
         shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
         shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -149,7 +150,7 @@ class RowParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor: # 列向量不用做任何操作 行切分要进行 all-reduce 操作
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)

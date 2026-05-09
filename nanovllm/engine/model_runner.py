@@ -21,9 +21,9 @@ class ModelRunner:
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
-        self.event = event
+        self.event = event  #主进程存储所有事件， 其他进程只存储一个事件用于等待主进程的调用
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank) # 设置通讯后端
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -39,8 +39,8 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+            if rank == 0: # main process负责创建共享内存和事件，其他进程等待
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20) # 使用 共享内存进行进程间通信
                 dist.barrier()
             else:
                 dist.barrier()
@@ -67,7 +67,7 @@ class ModelRunner:
 
     def read_shm(self):
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
+        self.event.wait() # 等待主进程的调用
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
         self.event.clear()
@@ -78,19 +78,19 @@ class ModelRunner:
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
+        self.shm.buf[4:n+4] = data 
+        for event in self.event:  # 通知其他进程有新的调用
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.world_size > 1 and self.rank == 0: # main process通过共享内存调用其他进程的方法
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_peak_memory_stats() 
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         seq_len = min(max_num_batched_tokens, max_model_len)
         num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
@@ -100,21 +100,36 @@ class ModelRunner:
         self.run(seqs, True)
         torch.cuda.empty_cache()
 
-    def allocate_kv_cache(self):
+
+    """_summary_
+    self.kv_cache.shape =
+        [
+        2,                          # K 和 V
+        num_hidden_layers,           # 层数
+        num_kvcache_blocks,          # block 数
+        block_size,                  # 每个 block 的 token 数
+        num_kv_heads_per_rank,       # 当前 rank 负责的 KV heads
+        head_dim
+        ]
+    """
+    def allocate_kv_cache(self): # 每一个进程分配自己的kv cache 
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
+        free, total = torch.cuda.mem_get_info() # 获取当前GPU的空闲内存和总内存
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"] # 预热模型后GPU的峰值内存使用量
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # 一个block 的大小
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        
+        # 根据gpu_memory_utilization计算可用的block数量， 预留出模型和其他变量的内存
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
-        for module in self.model.modules():
+        for module in self.model.modules(): # 找出模型中所有有k_cache和v_cache属性的模块， 将kv_cache分配给它们
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
@@ -208,7 +223,7 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
+            graph.replay() # 直接使用捕获的计算图进行推理，避免了重复的前向计算和内存分配，提升性能
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
